@@ -1,11 +1,37 @@
 import { Worker, type Job } from "bullmq";
-import { connection } from "../lib/redis";
+import { connection, deliveriesQueue } from "../lib/redis";
 import { supabase } from "../lib/supabase";
+import { computeNextRetry } from "../lib/backoff";
 import type { Endpoint, Event } from "../lib/types";
 
 // Timeout for the outbound POST to an endpoint's URL, so a hanging
 // destination can't block the worker forever.
 const DELIVERY_TIMEOUT_MS = 5000;
+
+// For local testing only: set RELAYD_FAST_RETRY=1 (or any truthy value) to
+// use a much shorter retry schedule (5s/10s/15s/20s, dead-letter at attempt
+// 5) instead of the real schedule from lib/backoff.ts, so the full
+// retry-to-dead-letter cycle can be watched in under a minute. Never used
+// by default — the real computeNextRetry schedule always runs unless this
+// is explicitly set.
+const FAST_RETRY_SCHEDULE_MS: Record<number, number> = {
+  1: 5000,
+  2: 10000,
+  3: 15000,
+  4: 20000,
+};
+const FAST_RETRY_MAX_ATTEMPTS = 5;
+
+function getNextRetry(attemptNumber: number): { delayMs: number } | { deadLetter: true } {
+  if (process.env.RELAYD_FAST_RETRY) {
+    if (attemptNumber >= FAST_RETRY_MAX_ATTEMPTS) {
+      return { deadLetter: true };
+    }
+    return { delayMs: FAST_RETRY_SCHEDULE_MS[attemptNumber] };
+  }
+
+  return computeNextRetry(attemptNumber);
+}
 
 async function processDelivery(job: Job<{ eventId: string }>) {
   const { eventId } = job.data;
@@ -36,7 +62,22 @@ async function processDelivery(job: Job<{ eventId: string }>) {
     );
   }
 
-  console.log(`Processing event ${event.id} -> POSTing to ${endpoint.url}`);
+  const { count: previousAttempts, error: countError } = await supabase
+    .from("delivery_attempts")
+    .select("id", { count: "exact", head: true })
+    .eq("event_id", event.id);
+
+  if (countError) {
+    throw new Error(
+      `Failed to count previous delivery attempts for event ${event.id}: ${countError.message}`
+    );
+  }
+
+  const attemptNumber = (previousAttempts ?? 0) + 1;
+
+  console.log(
+    `Processing event ${event.id} (attempt ${attemptNumber}) -> POSTing to ${endpoint.url}`
+  );
 
   let statusCode: number | null = null;
   let success = false;
@@ -75,7 +116,7 @@ async function processDelivery(job: Job<{ eventId: string }>) {
 
   const { error: attemptError } = await supabase.from("delivery_attempts").insert({
     event_id: event.id,
-    attempt_number: 1,
+    attempt_number: attemptNumber,
     status_code: statusCode,
     success,
     error_message: errorMessage,
@@ -100,9 +141,51 @@ async function processDelivery(job: Job<{ eventId: string }>) {
     }
 
     console.log(`Delivered successfully (status ${statusCode})`);
-  } else {
-    console.log(`Delivery failed: ${errorMessage}`);
+    return;
   }
+
+  console.log(`Delivery failed: ${errorMessage}`);
+
+  const nextRetry = getNextRetry(attemptNumber);
+
+  if ("deadLetter" in nextRetry) {
+    const { error: updateError } = await supabase
+      .from("events")
+      .update({ status: "dead" })
+      .eq("id", event.id);
+
+    if (updateError) {
+      console.error(
+        `Failed to update event ${event.id} status to dead: ${updateError.message}`
+      );
+    }
+
+    console.log(
+      `Attempt ${attemptNumber} failed, max attempts reached — marking as dead`
+    );
+    return;
+  }
+
+  const { error: updateError } = await supabase
+    .from("events")
+    .update({ status: "retrying" })
+    .eq("id", event.id);
+
+  if (updateError) {
+    console.error(
+      `Failed to update event ${event.id} status to retrying: ${updateError.message}`
+    );
+  }
+
+  await deliveriesQueue.add(
+    "deliver",
+    { eventId: event.id },
+    { delay: nextRetry.delayMs }
+  );
+
+  console.log(
+    `Attempt ${attemptNumber} failed, retrying in ${nextRetry.delayMs}ms`
+  );
 }
 
 const worker = new Worker<{ eventId: string }>(
