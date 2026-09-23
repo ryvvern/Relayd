@@ -7,7 +7,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "vitest run"
+    "test": "vitest run",
+    "receiver": "tsx scripts/dummy-receiver.ts",
+    "worker": "tsx --env-file=.env.local worker/index.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.117.0",
