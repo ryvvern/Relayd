@@ -9,6 +9,8 @@ import { StatsStrip } from "./stats-strip";
 import { StatusPill } from "./status-pill";
 import { formatRelativeTime } from "@/lib/relative-time";
 
+export const dynamic = "force-dynamic";
+
 async function getData() {
   const { data: events, error: eventsError } = await supabase
     .from("events")
