@@ -48,6 +48,19 @@ async function processDelivery(job: Job<{ eventId: string }>) {
     );
   }
 
+  // Protects against duplicate delivery in this scenario: the worker
+  // successfully POSTs to the endpoint, then crashes before writing
+  // 'delivered' back to the events table. On restart, BullMQ redelivers the
+  // job (its at-least-once delivery guarantee), and without this check the
+  // receiver would get the same event a second time. This is not a complete
+  // solution (a crash between this check and the HTTP call isn't covered),
+  // but it handles the realistic case cheaply without needing DB locking or
+  // a transactional outbox.
+  if (event.status === "delivered") {
+    console.log(`Event ${event.id} already delivered, skipping duplicate job`);
+    return;
+  }
+
   const { data: endpoint, error: endpointError } = await supabase
     .from("endpoints")
     .select()
@@ -90,7 +103,10 @@ async function processDelivery(job: Job<{ eventId: string }>) {
     try {
       const response = await fetch(endpoint.url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": event.idempotency_key,
+        },
         body: JSON.stringify(event.payload),
         signal: controller.signal,
       });
@@ -146,7 +162,22 @@ async function processDelivery(job: Job<{ eventId: string }>) {
 
   console.log(`Delivery failed: ${errorMessage}`);
 
-  const nextRetry = getNextRetry(attemptNumber);
+  // A manually-retried 'dead' event (via the retry API) resumes counting
+  // from its existing delivery_attempts rows, so attemptNumber can exceed
+  // the normal 5-attempt ceiling (e.g. attempt 6). computeNextRetry throws
+  // for any attemptNumber outside 1-5, which is correct for that function's
+  // contract — but here, a failure past the ceiling must still result in
+  // 'dead' status, not an unhandled crash. Treat that throw the same as a
+  // deadLetter: true result.
+  let nextRetry: { delayMs: number } | { deadLetter: true };
+  try {
+    nextRetry = getNextRetry(attemptNumber);
+  } catch {
+    console.log(
+      `Attempt ${attemptNumber} failed and exceeds the normal retry ceiling — marking as dead`
+    );
+    nextRetry = { deadLetter: true };
+  }
 
   if ("deadLetter" in nextRetry) {
     const { error: updateError } = await supabase

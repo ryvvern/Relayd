@@ -20,6 +20,7 @@ const server = http.createServer((req, res) => {
       const body = rawBody ? JSON.parse(rawBody) : {};
       console.log("--- Received delivery ---");
       console.log("Path:", req.url);
+      console.log("Idempotency-Key:", req.headers["idempotency-key"] ?? "(none)");
       if (body.event_type !== undefined || body.payload !== undefined) {
         console.log("Event type:", body.event_type);
         console.log("Payload:", JSON.stringify(body.payload, null, 2));
@@ -30,6 +31,7 @@ const server = http.createServer((req, res) => {
     } catch {
       console.log("--- Received delivery (unparsable JSON) ---");
       console.log("Path:", req.url);
+      console.log("Idempotency-Key:", req.headers["idempotency-key"] ?? "(none)");
       console.log("Raw body:", rawBody);
       console.log("--------------------------------------------");
     }
