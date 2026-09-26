@@ -32,10 +32,14 @@ export function RetryButton({ eventId }: { eventId: string }) {
 
   return (
     <div>
-      <button onClick={handleRetry} disabled={pending}>
+      <button
+        onClick={handleRetry}
+        disabled={pending}
+        className="rounded-lg border border-hairline px-3 py-1.5 text-sm font-medium text-foreground disabled:opacity-50"
+      >
         {pending ? "Retrying..." : "Retry"}
       </button>
-      {error && <div>{error}</div>}
+      {error && <div className="mt-1 text-xs text-red-700">{error}</div>}
     </div>
   );
 }
